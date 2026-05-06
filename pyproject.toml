@@ -1,0 +1,19 @@
+[project]
+name = "kops"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "kaka-milan-22", email = "kakazhang10@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "mcp[cli]>=1.27.0",
+]
+
+[project.scripts]
+kops = "kops:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
