@@ -147,6 +147,126 @@ def _truncate(text: str, limit: int = 30000) -> str:
     return text[:limit] + f"\n\n[truncated; full output was {len(text)} chars, showing first {limit}]"
 
 
+def _container_images(pod_template_spec: dict) -> list[dict]:
+    """Extract container name + image pairs from a pod-template-like spec section.
+    Accepts either a Pod's spec or a workload's spec.template.spec — both have `containers`.
+    """
+    out = []
+    for c in (pod_template_spec.get("containers") or []):
+        out.append({"container": c.get("name"), "image": c.get("image")})
+    inits = pod_template_spec.get("initContainers") or []
+    for c in inits:
+        out.append({"container": c.get("name"), "image": c.get("image"), "init": True})
+    return out
+
+
+# Memory units. Order matters — binary suffixes must be checked before decimal
+# (otherwise "Mi" gets matched as "M" first).
+_MEM_UNITS = [
+    ("Ei", 1024 ** 6), ("Pi", 1024 ** 5), ("Ti", 1024 ** 4),
+    ("Gi", 1024 ** 3), ("Mi", 1024 ** 2), ("Ki", 1024),
+    ("E", 10 ** 18), ("P", 10 ** 15), ("T", 10 ** 12),
+    ("G", 10 ** 9), ("M", 10 ** 6), ("K", 10 ** 3),
+]
+
+
+def _parse_cpu(v: str | None) -> int:
+    """Return millicores. K8s CPU: '100m'=100mc, '1'=1000mc, '0.5'=500mc."""
+    if not v:
+        return 0
+    s = str(v).strip()
+    if s.endswith("m"):
+        try:
+            return int(float(s[:-1]))
+        except ValueError:
+            return 0
+    try:
+        return int(float(s) * 1000)
+    except ValueError:
+        return 0
+
+
+def _parse_mem(v: str | None) -> int:
+    """Return bytes. Accepts Ki/Mi/Gi (binary), K/M/G (decimal), or plain bytes."""
+    if not v:
+        return 0
+    s = str(v).strip()
+    for unit, mult in _MEM_UNITS:
+        if s.endswith(unit):
+            try:
+                return int(float(s[:-len(unit)]) * mult)
+            except ValueError:
+                return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def _fmt_cpu(mc: int) -> str | None:
+    """millicores → human string. None when 0 (signals 'not declared')."""
+    if not mc:
+        return None
+    if mc < 1000:
+        return f"{mc}m"
+    cores = mc / 1000
+    return str(int(cores)) if cores == int(cores) else f"{cores:.1f}"
+
+
+def _fmt_mem(b: int) -> str | None:
+    """bytes → human string in binary units."""
+    if not b:
+        return None
+    if b >= 1024 ** 3:
+        gi = b / 1024 ** 3
+        return f"{int(gi)}Gi" if gi == int(gi) else f"{gi:.1f}Gi"
+    if b >= 1024 ** 2:
+        mi = b / 1024 ** 2
+        return f"{int(mi)}Mi" if mi == int(mi) else f"{mi:.0f}Mi"
+    if b >= 1024:
+        return f"{b // 1024}Ki"
+    return f"{b}"
+
+
+def _aggregate_resources(pod_template_spec: dict) -> dict | None:
+    """Sum resources.requests/limits across all main containers.
+
+    Init containers are excluded — they don't run concurrently with the workload's
+    steady state, so they don't add to standing resource footprint (k8s effectively
+    uses max(init_resources, sum(main_resources)) for scheduling).
+
+    Returns None when nothing was declared, so the caller can omit the field.
+    """
+    cs = pod_template_spec.get("containers") or []
+    if not cs:
+        return None
+    req_cpu = req_mem = lim_cpu = lim_mem = 0
+    seen_any = False
+    for c in cs:
+        r = c.get("resources") or {}
+        req = r.get("requests") or {}
+        lim = r.get("limits") or {}
+        for v in (req.get("cpu"), req.get("memory"), lim.get("cpu"), lim.get("memory")):
+            if v:
+                seen_any = True
+                break
+        req_cpu += _parse_cpu(req.get("cpu"))
+        req_mem += _parse_mem(req.get("memory"))
+        lim_cpu += _parse_cpu(lim.get("cpu"))
+        lim_mem += _parse_mem(lim.get("memory"))
+    if not seen_any:
+        return None
+    out = {}
+    requests = {k: v for k, v in (("cpu", _fmt_cpu(req_cpu)), ("memory", _fmt_mem(req_mem))) if v}
+    limits = {k: v for k, v in (("cpu", _fmt_cpu(lim_cpu)), ("memory", _fmt_mem(lim_mem))) if v}
+    if requests:
+        out["requests"] = requests
+    if limits:
+        out["limits"] = limits
+    return out or None
+    return out
+
+
 def _summarize_resource(item: dict) -> dict:
     """Extract key fields per kind. Avoids dumping full spec to keep token usage sane."""
     md = item.get("metadata") or {}
@@ -183,7 +303,12 @@ def _summarize_resource(item: dict) -> dict:
             "restarts": restarts,
             "node": spec.get("nodeName"),
             "podIP": status.get("podIP"),
+            "images": _container_images(spec),
+            "containerCount": len(spec.get("containers") or []),
         })
+        res = _aggregate_resources(spec)
+        if res:
+            base["resources"] = res
         if reason:
             base["reason"] = reason
     elif kind == "Service":
@@ -201,17 +326,29 @@ def _summarize_resource(item: dict) -> dict:
             ],
         })
     elif kind == "Deployment":
+        template_spec = ((spec.get("template") or {}).get("spec")) or {}
         base.update({
             "desired": spec.get("replicas"),
             "available": status.get("availableReplicas", 0),
             "updated": status.get("updatedReplicas", 0),
             "ready": status.get("readyReplicas", 0),
+            "images": _container_images(template_spec),
+            "containerCount": len(template_spec.get("containers") or []),
         })
+        res = _aggregate_resources(template_spec)
+        if res:
+            base["resources"] = res
     elif kind in ("StatefulSet", "DaemonSet", "ReplicaSet"):
+        template_spec = ((spec.get("template") or {}).get("spec")) or {}
         base.update({
             "desired": spec.get("replicas") or status.get("desiredNumberScheduled"),
             "ready": status.get("readyReplicas") or status.get("numberReady"),
+            "images": _container_images(template_spec),
+            "containerCount": len(template_spec.get("containers") or []),
         })
+        res = _aggregate_resources(template_spec)
+        if res:
+            base["resources"] = res
     elif kind == "Node":
         conds = {c["type"]: c["status"] for c in (status.get("conditions") or [])}
         base.update({
@@ -596,6 +733,151 @@ def k8s_triage(
         "events": warning_events[:30],
         "nodes": unhealthy_nodes,
         "deployments": stale_deploys,
+    }
+
+
+# Mapping from kubectl singular kind → output key on namespace entry.
+_INVENTORY_KIND_KEYS = {
+    "deployment": "deployments",
+    "statefulset": "statefulsets",
+    "daemonset": "daemonsets",
+    "service": "services",
+    "ingress": "ingresses",
+    "horizontalpodautoscaler": "hpa",
+    "persistentvolumeclaim": "pvcs",
+    "configmap": "configmaps",
+    "secret": "secrets",
+    "job": "jobs",
+    "cronjob": "cronjobs",
+    "gateways.networking.istio.io": "istio_gateways",
+    "virtualservices.networking.istio.io": "istio_virtualservices",
+    "destinationrules.networking.istio.io": "istio_destinationrules",
+}
+
+_INVENTORY_DEFAULT_KINDS = [
+    "deployment", "statefulset", "daemonset",
+    "service", "ingress", "horizontalpodautoscaler",
+    "persistentvolumeclaim",
+    "configmap", "secret",
+    "job", "cronjob",
+]
+
+_INVENTORY_ISTIO_KINDS = [
+    "gateways.networking.istio.io",
+    "virtualservices.networking.istio.io",
+    "destinationrules.networking.istio.io",
+]
+
+
+@mcp.tool()
+def k8s_inventory(
+    namespace: str | None = None,
+    include_istio: bool = True,
+    context: str | None = None,
+) -> dict:
+    """⭐ One-shot comprehensive cluster snapshot. Use for documentation, audits,
+    or any task that needs broad visibility — replaces ~50 individual k8s_get calls.
+
+    Returns nodes (cluster-scoped) and per-namespace inventory of: deployments,
+    statefulsets, daemonsets, services, ingresses, hpa, pvc, configmaps, secrets,
+    jobs, cronjobs. Each item is summarized (key fields only, no full spec dump).
+
+    Istio CRDs (Gateway / VirtualService / DestinationRule) are auto-included
+    when present; absent CRDs are silently skipped. Set include_istio=False to skip.
+
+    Pods are NOT included in the snapshot (potentially huge); only per-namespace
+    pod counts are surfaced in the summary. Use k8s_triage for pod health,
+    k8s_get pod for specifics.
+
+    ConfigMap data and Secret values are NEVER returned — only metadata.
+
+    Args:
+        namespace: Limit scope to a single namespace; omit for cluster-wide.
+        include_istio: Auto-detect and include Istio CRDs (default True).
+        context: kubeconfig context.
+    """
+    ns = _validate_name(namespace, "namespace")
+    ctx = _ctx_args(context)
+    ns_args = ["-n", ns] if ns else ["-A"]
+
+    namespaced_kinds = list(_INVENTORY_DEFAULT_KINDS)
+    if include_istio:
+        namespaced_kinds.extend(_INVENTORY_ISTIO_KINDS)
+
+    def fetch(args: list[str]) -> dict | None:
+        try:
+            return json.loads(_run_kubectl(args))
+        except RuntimeError:
+            # CRD not installed, namespace gone, etc. Return None and skip.
+            return None
+
+    pods_args = ["get", "pod", *ns_args, "-o", "json", *ctx]
+    namespaces_args = ["get", "namespace", "-o", "json", *ctx]
+    nodes_args = ["get", "node", "-o", "json", *ctx]
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        f_namespaces = ex.submit(fetch, namespaces_args)
+        f_nodes = ex.submit(fetch, nodes_args) if ns is None else None
+        f_pods = ex.submit(fetch, pods_args)
+        kind_futures = {
+            kind: ex.submit(fetch, ["get", kind, *ns_args, "-o", "json", *ctx])
+            for kind in namespaced_kinds
+        }
+
+        namespaces_payload = f_namespaces.result() or {"items": []}
+        nodes_payload = f_nodes.result() if f_nodes else {"items": []}
+        pods_payload = f_pods.result() or {"items": []}
+        kind_payloads = {kind: f.result() for kind, f in kind_futures.items()}
+
+    items_by_ns_kind: dict[str, dict[str, list[dict]]] = {}
+    by_kind_counts: dict[str, int] = {}
+    istio_present = False
+    for kind, payload in kind_payloads.items():
+        if payload is None:
+            continue
+        items = payload.get("items", [])
+        out_key = _INVENTORY_KIND_KEYS.get(kind, kind)
+        if kind in _INVENTORY_ISTIO_KINDS and items:
+            istio_present = True
+        by_kind_counts[out_key] = len(items)
+        for item in items:
+            item_ns = (item.get("metadata") or {}).get("namespace") or ""
+            items_by_ns_kind.setdefault(item_ns, {}).setdefault(out_key, []).append(
+                _summarize_resource(item)
+            )
+
+    pods_per_ns: dict[str, int] = {}
+    for p in pods_payload.get("items", []):
+        item_ns = (p.get("metadata") or {}).get("namespace") or ""
+        pods_per_ns[item_ns] = pods_per_ns.get(item_ns, 0) + 1
+
+    nodes_summary = [_summarize_resource(n) for n in nodes_payload.get("items", [])]
+
+    namespace_entries: list[dict] = []
+    for ns_item in namespaces_payload.get("items", []):
+        nm = (ns_item.get("metadata") or {}).get("name")
+        if ns and nm != ns:
+            continue
+        entry = _summarize_resource(ns_item)
+        entry["pods"] = pods_per_ns.get(nm, 0)
+        for out_key, items in items_by_ns_kind.get(nm, {}).items():
+            entry[out_key] = items
+        namespace_entries.append(entry)
+
+    namespace_entries.sort(key=lambda e: e["name"])
+
+    return {
+        "summary": {
+            "scope": f"namespace={ns}" if ns else "cluster-wide",
+            "namespaces": len(namespace_entries),
+            "nodes": len(nodes_summary),
+            "pods_total": sum(pods_per_ns.values()),
+            "by_kind_counts": by_kind_counts,
+            "istio_present": istio_present,
+            "include_istio": include_istio,
+        },
+        "nodes": nodes_summary,
+        "namespaces": namespace_entries,
     }
 
 
