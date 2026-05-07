@@ -29,19 +29,31 @@ uv sync
 
 ## Smoke test (no cluster needed)
 
+MCP requires a handshake (`initialize` → `notifications/initialized`) before any business request, so a bare `tools/list` over stdin is rejected with `Received request before initialization was complete`. Feed all three messages in order:
+
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | uv run kops
+{
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+} | uv run kops
 ```
 
-Expect a JSON response listing the **6 tools** with input schemas.
+Expect: an `initialize` response, then a `tools/list` response listing the **6 tools** with input schemas. (The notification has no `id` and produces no reply.)
 
 ## Visual debug with MCP Inspector
 
+For interactive debugging, skip the raw stdio dance and use the official tools — they handle the handshake for you:
+
 ```bash
+# Option A: MCP Inspector (browser UI)
 npx @modelcontextprotocol/inspector uv --directory /Users/kaka/claude/kops run kops
+
+# Option B: mcp dev (bundled with the mcp[cli] extra already in deps)
+uv run mcp dev src/kops/server.py
 ```
 
-Open the URL it prints, click each tool, exercise the parameters.
+Open the URL each prints, click a tool, exercise its parameters.
 
 ## Register with Claude Code
 
