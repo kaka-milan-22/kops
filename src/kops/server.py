@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -772,43 +773,59 @@ _INVENTORY_ISTIO_KINDS = [
 @mcp.tool()
 def k8s_inventory(
     namespace: str | None = None,
+    mode: str = "full",
+    include_config_resources: bool = False,
     include_istio: bool = True,
     context: str | None = None,
 ) -> dict:
     """⭐ One-shot comprehensive cluster snapshot. Use for documentation, audits,
     or any task that needs broad visibility — replaces ~50 individual k8s_get calls.
 
-    Returns nodes (cluster-scoped) and per-namespace inventory of: deployments,
-    statefulsets, daemonsets, services, ingresses, hpa, pvc, configmaps, secrets,
-    jobs, cronjobs. Each item is summarized (key fields only, no full spec dump).
+    Modes:
+      - "full" (default): expand each namespaced item to its summarized form
+        (deployment images, service ports, etc.). Use for documentation or audits.
+      - "overview": skip per-item expansion. Each namespace entry carries only
+        a `by_kind_counts` map. ~10-20× smaller payload. Use to scan cluster
+        shape before drilling in with namespace-scoped follow-up calls.
+
+    By default, ConfigMap and Secret lists are EXCLUDED — they are typically the
+    largest noise-to-signal source in cluster-wide inventories. Set
+    include_config_resources=True to include them in by_kind_counts and the
+    per-namespace breakdown. ConfigMap data and Secret values are NEVER
+    returned — only metadata.
+
+    Pods are NOT included in the snapshot (potentially huge); only per-namespace
+    pod counts are surfaced. Use k8s_triage for pod health, k8s_get pod for specifics.
 
     Istio CRDs (Gateway / VirtualService / DestinationRule) are auto-included
     when present; absent CRDs are silently skipped. Set include_istio=False to skip.
 
-    Pods are NOT included in the snapshot (potentially huge); only per-namespace
-    pod counts are surfaced in the summary. Use k8s_triage for pod health,
-    k8s_get pod for specifics.
-
-    ConfigMap data and Secret values are NEVER returned — only metadata.
-
     Args:
         namespace: Limit scope to a single namespace; omit for cluster-wide.
+        mode: "full" (default, expand items) or "overview" (counts only).
+        include_config_resources: Include ConfigMaps and Secrets (default False).
         include_istio: Auto-detect and include Istio CRDs (default True).
         context: kubeconfig context.
     """
+    if mode not in ("full", "overview"):
+        raise ValueError("mode must be 'full' or 'overview'")
+
     ns = _validate_name(namespace, "namespace")
     ctx = _ctx_args(context)
     ns_args = ["-n", ns] if ns else ["-A"]
 
     namespaced_kinds = list(_INVENTORY_DEFAULT_KINDS)
+    if not include_config_resources:
+        namespaced_kinds = [k for k in namespaced_kinds if k not in ("configmap", "secret")]
     if include_istio:
         namespaced_kinds.extend(_INVENTORY_ISTIO_KINDS)
 
     def fetch(args: list[str]) -> dict | None:
         try:
             return json.loads(_run_kubectl(args))
-        except RuntimeError:
+        except RuntimeError as e:
             # CRD not installed, namespace gone, etc. Return None and skip.
+            print(f"[kops.inventory] skip {' '.join(args[:3])}: {e}", file=sys.stderr)
             return None
 
     pods_args = ["get", "pod", *ns_args, "-o", "json", *ctx]
@@ -825,11 +842,12 @@ def k8s_inventory(
         }
 
         namespaces_payload = f_namespaces.result() or {"items": []}
-        nodes_payload = f_nodes.result() if f_nodes else {"items": []}
+        nodes_payload = (f_nodes.result() if f_nodes else None) or {"items": []}
         pods_payload = f_pods.result() or {"items": []}
         kind_payloads = {kind: f.result() for kind, f in kind_futures.items()}
 
     items_by_ns_kind: dict[str, dict[str, list[dict]]] = {}
+    counts_by_ns_kind: dict[str, dict[str, int]] = {}
     by_kind_counts: dict[str, int] = {}
     istio_present = False
     for kind, payload in kind_payloads.items():
@@ -842,9 +860,13 @@ def k8s_inventory(
         by_kind_counts[out_key] = len(items)
         for item in items:
             item_ns = (item.get("metadata") or {}).get("namespace") or ""
-            items_by_ns_kind.setdefault(item_ns, {}).setdefault(out_key, []).append(
-                _summarize_resource(item)
-            )
+            if mode == "overview":
+                ns_counts = counts_by_ns_kind.setdefault(item_ns, {})
+                ns_counts[out_key] = ns_counts.get(out_key, 0) + 1
+            else:
+                items_by_ns_kind.setdefault(item_ns, {}).setdefault(out_key, []).append(
+                    _summarize_resource(item)
+                )
 
     pods_per_ns: dict[str, int] = {}
     for p in pods_payload.get("items", []):
@@ -860,8 +882,11 @@ def k8s_inventory(
             continue
         entry = _summarize_resource(ns_item)
         entry["pods"] = pods_per_ns.get(nm, 0)
-        for out_key, items in items_by_ns_kind.get(nm, {}).items():
-            entry[out_key] = items
+        if mode == "overview":
+            entry["by_kind_counts"] = counts_by_ns_kind.get(nm, {})
+        else:
+            for out_key, items in items_by_ns_kind.get(nm, {}).items():
+                entry[out_key] = items
         namespace_entries.append(entry)
 
     namespace_entries.sort(key=lambda e: e["name"])
@@ -869,12 +894,14 @@ def k8s_inventory(
     return {
         "summary": {
             "scope": f"namespace={ns}" if ns else "cluster-wide",
+            "mode": mode,
             "namespaces": len(namespace_entries),
             "nodes": len(nodes_summary),
             "pods_total": sum(pods_per_ns.values()),
             "by_kind_counts": by_kind_counts,
             "istio_present": istio_present,
             "include_istio": include_istio,
+            "include_config_resources": include_config_resources,
         },
         "nodes": nodes_summary,
         "namespaces": namespace_entries,
