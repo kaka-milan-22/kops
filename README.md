@@ -22,10 +22,17 @@ Two aggregator tools (`k8s_triage`, `k8s_inventory`) compress common multi-step 
 
 ## Install
 
+Requires [`uv`](https://docs.astral.sh/uv/) and `kubectl` in your `PATH`.
+
 ```bash
-cd /Users/kaka/claude/kops
+git clone https://github.com/kaka-milan-22/kops.git
+cd kops
 uv sync
 ```
+
+> The commands below use `/path/to/kops` for the absolute path of this clone â€”
+> replace it with your actual path (e.g. the output of `pwd` run from inside the
+> cloned directory). `uv --directory` needs an absolute path.
 
 ## Smoke test (no cluster needed)
 
@@ -47,7 +54,7 @@ For interactive debugging, skip the raw stdio dance and use the official tools â
 
 ```bash
 # Option A: MCP Inspector (browser UI)
-npx @modelcontextprotocol/inspector uv --directory /Users/kaka/claude/kops run kops
+npx @modelcontextprotocol/inspector uv --directory /path/to/kops run kops
 
 # Option B: mcp dev (bundled with the mcp[cli] extra already in deps)
 uv run mcp dev src/kops/server.py
@@ -58,7 +65,7 @@ Open the URL each prints, click a tool, exercise its parameters.
 ## Register with Claude Code
 
 ```bash
-claude mcp add -s user kops -- uv --directory /Users/kaka/claude/kops run kops
+claude mcp add -s user kops -- uv --directory /path/to/kops run kops
 ```
 
 Or manually in `~/.claude.json` under `mcpServers`:
@@ -68,7 +75,7 @@ Or manually in `~/.claude.json` under `mcpServers`:
   "mcpServers": {
     "kops": {
       "command": "uv",
-      "args": ["--directory", "/Users/kaka/claude/kops", "run", "kops"]
+      "args": ["--directory", "/path/to/kops", "run", "kops"]
     }
   }
 }
@@ -82,7 +89,7 @@ To talk to a foreign cluster without polluting `~/.kube/config`, register a sepa
 
 ```bash
 claude mcp add -s user -e KUBECONFIG=/path/to/qa-cluster.yaml \
-  kops-qa -- uv --directory /Users/kaka/claude/kops run kops
+  kops-qa -- uv --directory /path/to/kops run kops
 ```
 
 Tools then surface as `mcp__kops_qa__k8s_triage` etc, fully isolated.
