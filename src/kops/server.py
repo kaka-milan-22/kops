@@ -1,6 +1,6 @@
 """kops — read-only kubectl helper exposed via MCP.
 
-Five tools: k8s_get, k8s_describe, k8s_logs, k8s_events, k8s_triage.
+Six tools: k8s_get, k8s_describe, k8s_logs, k8s_events, k8s_triage, k8s_inventory.
 
 All operations are strictly read-only. The verb passed to kubectl is hardcoded
 in each tool function; user input only fills argument values, never the verb,
@@ -265,7 +265,6 @@ def _aggregate_resources(pod_template_spec: dict) -> dict | None:
     if limits:
         out["limits"] = limits
     return out or None
-    return out
 
 
 def _summarize_resource(item: dict) -> dict:

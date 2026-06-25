@@ -1,7 +1,7 @@
 [project]
 name = "kops"
 version = "0.1.0"
-description = "Add your description here"
+description = "Read-only kubectl exposed to Claude Code as an MCP server — structured JSON, hardcoded safe verbs, one-shot triage & inventory."
 readme = "README.md"
 authors = [
     { name = "kaka-milan-22", email = "kakazhang10@gmail.com" }
