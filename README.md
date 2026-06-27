@@ -2,6 +2,8 @@
 
 Read-only `kubectl` helper exposed to Claude Code via MCP. Six tools, all strictly read-only — verbs (`get`, `describe`, `logs`) are hardcoded; user input only fills argument values, never the verb itself.
 
+![kops quickstart](docs/quickstart.gif)
+
 | Tool | What it does |
 |------|------|
 | `k8s_get` | List/fetch resources, returns summarized key fields per kind |
