@@ -15,8 +15,10 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 mcp = FastMCP("kops")
 
@@ -374,16 +376,40 @@ def _summarize_resource(item: dict) -> dict:
 
 @mcp.tool()
 def k8s_get(
-    kind: str,
-    namespace: str | None = None,
-    name: str | None = None,
-    selector: str | None = None,
-    context: str | None = None,
+    kind: Annotated[str, Field(description=(
+        "Resource kind (singular, plural, or short alias). Accepted: pod/po, "
+        "svc/service, deploy/deployment, sts/statefulset, ds/daemonset, "
+        "rs/replicaset, cm/configmap, secret, ns/namespace, node, ingress, "
+        "hpa, pvc, job, cronjob, sa/serviceaccount, and the Istio kinds "
+        "gateway/virtualservice/destinationrule. Other lowercase kinds are "
+        "passed through. Secret/ConfigMap VALUES are never returned — metadata only."
+    ))],
+    namespace: Annotated[str | None, Field(description=(
+        "Target namespace. Omit to scan ALL namespaces (adds -A). "
+        "Must match ^[a-zA-Z0-9._-]{1,253}$."
+    ))] = None,
+    name: Annotated[str | None, Field(description=(
+        "Exact resource name to fetch one item. Omit to list many. "
+        "Must match ^[a-zA-Z0-9._-]{1,253}$. No partial/glob matching."
+    ))] = None,
+    selector: Annotated[str | None, Field(description=(
+        'K8s label selector, comma-separated, e.g. "app=foo,env=prod" or '
+        '"tier!=cache". Ignored when `name` is given.'
+    ))] = None,
+    context: Annotated[str | None, Field(description=(
+        "kubeconfig context name. Omit to use the current context. Cannot "
+        "inject a KUBECONFIG path."
+    ))] = None,
 ) -> list[dict]:
     """List or fetch K8s resources, returning summarized key fields per resource.
 
-    Use this to scan resources or fetch a specific one by name. For deeper
-    detail (events, conditions, container info), use k8s_describe.
+    Read-only: runs `kubectl get -o json` only — never creates, mutates, or
+    deletes anything, and is safe to call repeatedly (idempotent). Requires a
+    kubeconfig with read/list access to the target kind/namespace; raises on
+    kubectl failure (e.g. NotFound, Forbidden, unreachable cluster). Output is
+    summarized (not raw spec) to keep tokens low; Secret/ConfigMap values are
+    never included. For deeper detail (events, conditions, container info), use
+    k8s_describe.
 
     Args:
         kind: Resource kind. Common: pod, svc, deploy, sts, ds, cm, secret, ns,
@@ -421,16 +447,29 @@ def k8s_get(
 
 @mcp.tool()
 def k8s_describe(
-    kind: str,
-    name: str,
-    namespace: str | None = None,
-    context: str | None = None,
+    kind: Annotated[str, Field(description=(
+        "Resource kind (singular, plural, or short alias), same set as k8s_get "
+        "(e.g. pod, deploy, svc, node, ingress). Required."
+    ))],
+    name: Annotated[str, Field(description=(
+        "Exact resource name. Required, no glob/partial matching. "
+        "Must match ^[a-zA-Z0-9._-]{1,253}$."
+    ))],
+    namespace: Annotated[str | None, Field(description=(
+        "Target namespace. Omit for cluster-scoped kinds (e.g. node) or to use "
+        "the default namespace. Must match ^[a-zA-Z0-9._-]{1,253}$."
+    ))] = None,
+    context: Annotated[str | None, Field(description=(
+        "kubeconfig context name; omit to use the current context."
+    ))] = None,
 ) -> str:
     """Describe a single K8s resource (text output from `kubectl describe`).
 
-    Use when k8s_get isn't enough — describe shows events, conditions,
-    container details, volume mounts, image pull state, etc. Output is
-    human-readable text, not JSON.
+    Read-only: runs `kubectl describe` only — never mutates the cluster,
+    idempotent. Requires read access to the resource; raises on kubectl failure
+    (e.g. NotFound, Forbidden). Returns human-readable TEXT (not JSON), truncated
+    to ~30 KB. Use when k8s_get isn't enough — describe shows events, conditions,
+    container details, volume mounts, image pull state, etc.
 
     Args:
         kind: Resource kind.
@@ -455,15 +494,38 @@ def k8s_describe(
 
 @mcp.tool()
 def k8s_logs(
-    pod: str,
-    namespace: str | None = None,
-    container: str | None = None,
-    tail: int = 100,
-    since: str | None = None,
-    previous: bool = False,
-    context: str | None = None,
+    pod: Annotated[str, Field(description=(
+        "Pod name (required, exact match, ^[a-zA-Z0-9._-]{1,253}$)."
+    ))],
+    namespace: Annotated[str | None, Field(description=(
+        "Target namespace; omit to use the default namespace."
+    ))] = None,
+    container: Annotated[str | None, Field(description=(
+        "Container name — required only for multi-container pods; omit for "
+        "single-container pods."
+    ))] = None,
+    tail: Annotated[int, Field(description=(
+        "Number of lines from the end of the log. Default 100; clamped to "
+        "1..1000 (values above 1000 are capped)."
+    ))] = 100,
+    since: Annotated[str | None, Field(description=(
+        'Only logs newer than this relative window. Format ^\\d+[smhd]$ '
+        '(e.g. "5m", "1h", "2d"). Omit for no time bound.'
+    ))] = None,
+    previous: Annotated[bool, Field(description=(
+        "If true, fetch the PREVIOUS (crashed/restarted) container instance's "
+        "logs — use to debug a CrashLoopBackOff. Default false."
+    ))] = False,
+    context: Annotated[str | None, Field(description=(
+        "kubeconfig context name; omit to use the current context."
+    ))] = None,
 ) -> str:
     """Fetch logs from a pod.
+
+    Read-only: runs `kubectl logs` only — never mutates the cluster, idempotent.
+    Requires read access to pod logs; raises on kubectl failure (e.g. pod
+    NotFound, container not yet started, Forbidden). Output is truncated to
+    ~50 KB.
 
     Args:
         pod: Pod name (required).
@@ -500,16 +562,31 @@ def k8s_logs(
 
 @mcp.tool()
 def k8s_events(
-    namespace: str | None = None,
-    kind: str | None = None,
-    name: str | None = None,
-    since: str = "30m",
-    context: str | None = None,
+    namespace: Annotated[str | None, Field(description=(
+        "Target namespace. Omit for cluster-wide events."
+    ))] = None,
+    kind: Annotated[str | None, Field(description=(
+        'Filter by involvedObject.kind, capitalized as K8s reports it '
+        '(e.g. "Pod", "Node", "Deployment"). Omit for all kinds.'
+    ))] = None,
+    name: Annotated[str | None, Field(description=(
+        "Filter by involvedObject.name. Use together with `kind` to target one "
+        "object's events."
+    ))] = None,
+    since: Annotated[str, Field(description=(
+        'Recency window, format ^\\d+[smhd]$ (e.g. "30m", "1h", "2d"). '
+        'Default "30m".'
+    ))] = "30m",
+    context: Annotated[str | None, Field(description=(
+        "kubeconfig context name; omit to use the current context."
+    ))] = None,
 ) -> list[dict]:
     """List recent K8s events, most recent first.
 
-    Use this to surface scheduling failures, image pull problems, OOMKilled,
-    network issues, etc. Filter by namespace and/or involved object.
+    Read-only: lists events only — never mutates the cluster, idempotent.
+    Requires read access to events; raises on kubectl failure. Use this to
+    surface scheduling failures, image pull problems, OOMKilled, network issues,
+    etc. Filter by namespace and/or involved object.
 
     Args:
         namespace: Target namespace; omit for cluster-wide.
@@ -575,16 +652,26 @@ def k8s_events(
 
 @mcp.tool()
 def k8s_triage(
-    namespace: str | None = None,
-    since: str = "1h",
-    context: str | None = None,
+    namespace: Annotated[str | None, Field(description=(
+        "Limit the scan to one namespace; omit for cluster-wide triage."
+    ))] = None,
+    since: Annotated[str, Field(description=(
+        'Warning-event recency window, format ^\\d+[smhd]$ (e.g. "1h", "30m", '
+        '"1d"). Default "1h".'
+    ))] = "1h",
+    context: Annotated[str | None, Field(description=(
+        "kubeconfig context name; omit to use the current context."
+    ))] = None,
 ) -> dict:
     """⭐ Start here for cluster diagnostics. Single call returns:
     problem pods, recent warning events, unhealthy nodes, and stale deployments.
 
-    Use this as the first tool when asked broad questions like "what's wrong
-    with this cluster", "anything broken", or "give me a health summary".
-    Then dig deeper with k8s_describe / k8s_logs / k8s_events for specifics.
+    Read-only: fans out several `kubectl get` calls only — never mutates the
+    cluster, idempotent. Requires read access cluster-wide (or to the given
+    namespace); individual sub-queries that are Forbidden/absent are skipped
+    rather than aborting. Use this as the FIRST tool for broad questions like
+    "what's wrong with this cluster", "anything broken", or "give me a health
+    summary", then dig deeper with k8s_describe / k8s_logs / k8s_events.
 
     Args:
         namespace: Limit scope to a single namespace; omit for cluster-wide.
@@ -771,14 +858,34 @@ _INVENTORY_ISTIO_KINDS = [
 
 @mcp.tool()
 def k8s_inventory(
-    namespace: str | None = None,
-    mode: str = "full",
-    include_config_resources: bool = False,
-    include_istio: bool = True,
-    context: str | None = None,
+    namespace: Annotated[str | None, Field(description=(
+        "Limit the snapshot to one namespace; omit for a cluster-wide snapshot."
+    ))] = None,
+    mode: Annotated[str, Field(description=(
+        'Detail level. "full" (default) expands each item to summarized fields; '
+        '"overview" returns per-namespace by_kind_counts only (~10-20× smaller). '
+        'Only these two values are accepted.'
+    ))] = "full",
+    include_config_resources: Annotated[bool, Field(description=(
+        "Include ConfigMaps and Secrets in counts and per-namespace breakdown. "
+        "Default false (they are the biggest noise source). Values are NEVER "
+        "returned either way — metadata only."
+    ))] = False,
+    include_istio: Annotated[bool, Field(description=(
+        "Auto-detect and include Istio CRDs (Gateway/VirtualService/"
+        "DestinationRule) when present. Default true; absent CRDs are skipped."
+    ))] = True,
+    context: Annotated[str | None, Field(description=(
+        "kubeconfig context name; omit to use the current context."
+    ))] = None,
 ) -> dict:
     """⭐ One-shot comprehensive cluster snapshot. Use for documentation, audits,
     or any task that needs broad visibility — replaces ~50 individual k8s_get calls.
+
+    Read-only: fans out many `kubectl get -o json` calls only — never mutates the
+    cluster, idempotent. Requires broad read access (or read on the given
+    namespace); kinds that are Forbidden/absent are skipped silently rather than
+    failing the whole call. Pods are excluded from the payload (counts only).
 
     Modes:
       - "full" (default): expand each namespaced item to its summarized form
